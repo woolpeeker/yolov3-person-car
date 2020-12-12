@@ -1,0 +1,4 @@
+classes=2
+train=../coco2017_person/train2017.txt
+valid=../coco2017_person/val2017.txt
+names=data/coco_person.names

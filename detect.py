@@ -1,151 +1,206 @@
 import argparse
-import time
 
-from models import *
+from models import *  # set ONNX_EXPORT in models.py
 from utils.datasets import *
 from utils.utils import *
 
-cuda = torch.cuda.is_available()
-device = torch.device('cuda:0' if cuda else 'cpu')
 
-parser = argparse.ArgumentParser()
-# Get data configuration
+def detect(save_img=False):
+    imgsz = (320, 192) if ONNX_EXPORT else opt.img_size  # (320, 192) or (416, 256) or (608, 352) for (height, width)
+    out, source, weights, half, view_img, save_txt = opt.output, opt.source, opt.weights, opt.half, opt.view_img, opt.save_txt
+    save_img = opt.save_img
+    # webcam = source == '0' or source.startswith('rtsp') or source.startswith('http') or source.endswith('.txt')
+    webcam = False
+    save_txt = Path(save_txt)
+    if str(save_txt).endswith('.txt'):
+        txt_file = save_txt
+        save_txt = True
+        txt_file.parent.mkdir(parents=True, exist_ok=True)
+        txt_file = open(txt_file, 'w')
+    else:
+        save_txt = False
 
-# cd yolo && python3 detect.py -secondary_classifier 1
-parser.add_argument('-image_folder', type=str, default='data/samples', help='path to images')
-parser.add_argument('-output_folder', type=str, default='output', help='path to outputs')
-parser.add_argument('-plot_flag', type=bool, default=True)
-parser.add_argument('-txt_out', type=bool, default=False)
+    # Initialize
+    device = torch_utils.select_device(device='cpu' if ONNX_EXPORT else opt.device)
+    if os.path.exists(out):
+        shutil.rmtree(out)  # delete output folder
+    os.makedirs(out)  # make new output folder
 
-parser.add_argument('-cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
-parser.add_argument('-class_path', type=str, default='data/coco.names', help='path to class label file')
-parser.add_argument('-conf_thres', type=float, default=0.8, help='object confidence threshold')
-parser.add_argument('-nms_thres', type=float, default=0.5, help='iou threshold for non-maximum suppression')
-parser.add_argument('-batch_size', type=int, default=1, help='size of the batches')
-parser.add_argument('-img_size', type=int, default=32 * 13, help='size of each image dimension')
-opt = parser.parse_args()
-print(opt)
+    # Initialize model
+    model = Darknet(opt.cfg, imgsz)
 
+    # Load weights
+    attempt_download(weights)
+    if weights.endswith('.pt'):  # pytorch format
+        model.load_state_dict(torch.load(weights, map_location=device)['model'])
+    else:  # darknet format
+        load_darknet_weights(model, weights)
 
-def detect(opt):
-    os.system('rm -rf ' + opt.output_folder)
-    os.makedirs(opt.output_folder, exist_ok=True)
+    # Second-stage classifier
+    classify = False
+    if classify:
+        modelc = torch_utils.load_classifier(name='resnet101', n=2)  # initialize
+        modelc.load_state_dict(torch.load('weights/resnet101.pt', map_location=device)['model'])  # load weights
+        modelc.to(device).eval()
 
-    # Load model
-    model = Darknet(opt.cfg, opt.img_size)
-
-    weights_path = 'checkpoints/yolov3.weights'
-    if weights_path.endswith('.weights'):  # saved in darknet format
-        load_weights(model, weights_path)
-    else:  # endswith('.pt'), saved in pytorch format
-        checkpoint = torch.load(weights_path, map_location='cpu')
-        model.load_state_dict(checkpoint['model'])
-        del checkpoint
-
-        # current = model.state_dict()
-        # saved = checkpoint['model']
-        # # 1. filter out unnecessary keys
-        # saved = {k: v for k, v in saved.items() if ((k in current) and (current[k].shape == v.shape))}
-        # # 2. overwrite entries in the existing state dict
-        # current.update(saved)
-        # # 3. load the new state dict
-        # model.load_state_dict(current)
-        # model.to(device).eval()
-        # del checkpoint, current, saved
-
+    # Eval mode
     model.to(device).eval()
 
-    # Set Dataloader
-    classes = load_classes(opt.class_path)  # Extracts class labels from file
-    dataloader = ImageFolder(opt.image_folder, batch_size=opt.batch_size, img_size=opt.img_size)
+    # Fuse Conv2d + BatchNorm2d layers
+    # model.fuse()
 
-    imgs = []  # Stores image paths
-    img_detections = []  # Stores detections for each image index
-    prev_time = time.time()
-    detections = None
-    for batch_i, (img_paths, img) in enumerate(dataloader):
-        print(batch_i, img.shape, end=' ')
-        preds = []
+    # Export mode
+    if ONNX_EXPORT:
+        model.fuse()
+        img = torch.zeros((1, 3) + imgsz)  # (1, 3, 320, 192)
+        f = opt.weights.replace(opt.weights.split('.')[-1], 'onnx')  # *.onnx filename
+        torch.onnx.export(model, img, f, verbose=False, opset_version=11,
+                          input_names=['images'], output_names=['classes', 'boxes'])
 
-        # Get detections
-        with torch.no_grad():
-            # Normal orientation
-            chip = torch.from_numpy(img).unsqueeze(0).to(device)
-            pred = model(chip)
-            pred = pred[pred[:, :, 4] > opt.conf_thres]
-
-            if len(pred) > 0:
-                preds.append(pred.unsqueeze(0))
-
-        if len(preds) > 0:
-            detections = non_max_suppression(torch.cat(preds, 1), opt.conf_thres, opt.nms_thres)
-            img_detections.extend(detections)
-            imgs.extend(img_paths)
-
-        print('Batch %d... (Done %.3fs)' % (batch_i, time.time() - prev_time))
-        prev_time = time.time()
-
-    # Bounding-box colors
-    color_list = [[random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)] for _ in range(len(classes))]
-
-    if len(img_detections) == 0:
+        # Validate exported model
+        import onnx
+        model = onnx.load(f)  # Load the ONNX model
+        onnx.checker.check_model(model)  # Check that the IR is well formed
+        print(onnx.helper.printable_graph(model.graph))  # Print a human readable representation of the graph
         return
 
-    # Iterate through images and save plot of detections
-    for img_i, (path, detections) in enumerate(zip(imgs, img_detections)):
-        print("image %g: '%s'" % (img_i, path))
+    # Half precision
+    half = half and device.type != 'cpu'  # half precision only supported on CUDA
+    if half:
+        model.half()
 
-        if opt.plot_flag:
-            img = cv2.imread(path)
+    # Set Dataloader
+    vid_path, vid_writer = None, None
+    if webcam:
+        view_img = True
+        torch.backends.cudnn.benchmark = True  # set True to speed up constant image size inference
+        dataset = LoadStreams(source, img_size=imgsz)
+    else:
+        dataset = LoadImages(source, img_size=imgsz)
 
-        # The amount of padding that was added
-        pad_x = max(img.shape[0] - img.shape[1], 0) * (opt.img_size / max(img.shape))
-        pad_y = max(img.shape[1] - img.shape[0], 0) * (opt.img_size / max(img.shape))
-        # Image height and width after padding is removed
-        unpad_h = opt.img_size - pad_y
-        unpad_w = opt.img_size - pad_x
+    # Get names and colors
+    names = load_classes(opt.names)
+    colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(names))]
 
-        # Draw bounding boxes and labels of detections
-        if detections is not None:
-            unique_classes = detections[:, -1].cpu().unique()
-            bbox_colors = random.sample(color_list, len(unique_classes))
+    # Run inference
+    t0 = time.time()
+    img = torch.zeros((1, 3, imgsz, imgsz), device=device)  # init img
+    _ = model(img.half() if half else img.float()) if device.type != 'cpu' else None  # run once
+    for path, img, im0s, vid_cap in dataset:
+        img = torch.from_numpy(img).to(device)
+        img = img.half() if half else img.float()  # uint8 to fp16/32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        if img.ndimension() == 3:
+            img = img.unsqueeze(0)
 
-            # write results to .txt file
-            results_img_path = os.path.join(opt.output_folder, path.split('/')[-1])
-            results_txt_path = results_img_path + '.txt'
-            if os.path.isfile(results_txt_path):
-                os.remove(results_txt_path)
+        # Inference
+        t1 = torch_utils.time_synchronized()
+        print(img.shape)
+        pred = model(img, augment=opt.augment)[0]
+        t2 = torch_utils.time_synchronized()
 
-            for i in unique_classes:
-                n = (detections[:, -1].cpu() == i).sum()
-                print('%g %ss' % (n, classes[int(i)]))
+        # to float
+        if half:
+            pred = pred.float()
 
-            for x1, y1, x2, y2, conf, cls_conf, cls_pred in detections:
-                # Rescale coordinates to original dimensions
-                box_h = ((y2 - y1) / unpad_h) * img.shape[0]
-                box_w = ((x2 - x1) / unpad_w) * img.shape[1]
-                y1 = (((y1 - pad_y // 2) / unpad_h) * img.shape[0]).round().item()
-                x1 = (((x1 - pad_x // 2) / unpad_w) * img.shape[1]).round().item()
-                x2 = (x1 + box_w).round().item()
-                y2 = (y1 + box_h).round().item()
-                x1, y1, x2, y2 = max(x1, 0), max(y1, 0), max(x2, 0), max(y2, 0)
+        # Apply NMS
+        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres,
+                                   multi_label=False, classes=opt.classes, agnostic=opt.agnostic_nms)
 
-                # write to file
-                if opt.txt_out:
-                    with open(results_txt_path, 'a') as file:
-                        file.write(('%g %g %g %g %g %g \n') % (x1, y1, x2, y2, cls_pred, cls_conf * conf))
+        # Apply Classifier
+        if classify:
+            pred = apply_classifier(pred, modelc, img, im0s)
 
-                if opt.plot_flag:
-                    # Add the bbox to the plot
-                    label = '%s %.2f' % (classes[int(cls_pred)], cls_conf) if cls_conf > 0.05 else None
-                    color = bbox_colors[int(np.where(unique_classes == int(cls_pred))[0])]
-                    plot_one_box([x1, y1, x2, y2], img, label=label, color=color, line_thickness=3)
+        # Process detections
+        for i, det in enumerate(pred):  # detections for image i
+            if webcam:  # batch_size >= 1
+                p, s, im0 = path[i], '%g: ' % i, im0s[i].copy()
+            else:
+                p, s, im0 = path, '', im0s
 
-        if opt.plot_flag:
-            # Save generated image with detections
-            cv2.imwrite(results_img_path.replace('.bmp', '.jpg').replace('.tif', '.jpg'), img)
+            save_path = str(Path(out) / Path(p).name)
+            s += '%gx%g ' % img.shape[2:]  # print string
+            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  #  normalization gain whwh
+            if det is not None and len(det):
+                # Rescale boxes from imgsz to im0 size
+                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+
+                # Print results
+                for c in det[:, -1].unique():
+                    n = (det[:, -1] == c).sum()  # detections per class
+                    s += '%g %ss, ' % (n, names[int(c)])  # add to string
+
+                # Write results
+                for *xyxy, conf, cls in reversed(det):
+                    if save_txt:  # Write to file
+                        file_id = Path(p).with_suffix('').name
+                        txt_file.write('%s %s %f %d %d %d %d\n' % (file_id, names[int(cls)], conf, *xyxy))
+
+                    if save_img or view_img:  # Add bbox to image
+                        label = '%s %.2f' % (names[int(cls)], conf)
+                        plot_one_box(xyxy, im0, label=label, color=colors[int(cls)])
+            else:
+                if save_txt:  # Write to file
+                    file_id = Path(p).with_suffix('').name
+                    txt_file.write('%s %s %f %d %d %d %d\n' % (file_id, names[0], 0, 0, 0, 1, 1))
+
+
+            # Print time (inference + NMS)
+            print('%sDone. (%.3fs)' % (s, t2 - t1))
+
+            # Stream results
+            if view_img:
+                cv2.imshow(p, im0)
+                if cv2.waitKey(1) == ord('q'):  # q to quit
+                    raise StopIteration
+
+            # Save results (image with detections)
+            if save_img:
+                if dataset.mode == 'images':
+                    cv2.imwrite(save_path, im0)
+                else:
+                    if vid_path != save_path:  # new video
+                        vid_path = save_path
+                        if isinstance(vid_writer, cv2.VideoWriter):
+                            vid_writer.release()  # release previous video writer
+
+                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*opt.fourcc), fps, (w, h))
+                    vid_writer.write(im0)
+
+    if save_txt or save_img:
+        print('Results saved to %s' % os.getcwd() + os.sep + out)
+        if platform == 'darwin':  # MacOS
+            os.system('open ' + save_path)
+
+    print('Done. (%.3fs)' % (time.time() - t0))
 
 
 if __name__ == '__main__':
-    torch.cuda.empty_cache()
-    detect(opt)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
+    parser.add_argument('--names', type=str, default='data/coco.names', help='*.names path')
+    parser.add_argument('--weights', type=str, default='weights/yolov3-spp-ultralytics.pt', help='weights path')
+    parser.add_argument('--source', type=str, default='data/samples', help='source')  # input file/folder, 0 for webcam
+    parser.add_argument('--output', type=str, default='output', help='output folder')  # output folder
+    parser.add_argument('--img-size', type=int, default=512, help='inference size (pixels)')
+    parser.add_argument('--conf-thres', type=float, default=0.3, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.6, help='IOU threshold for NMS')
+    parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
+    parser.add_argument('--half', action='store_true', help='half precision FP16 inference')
+    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
+    parser.add_argument('--view-img', action='store_true', help='display results')
+    parser.add_argument('--save-txt', type=str, help='save results to *.txt')
+    parser.add_argument('--save-img', action='store_true', help='save images')
+    parser.add_argument('--classes', nargs='+', type=int, help='filter by class')
+    parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
+    parser.add_argument('--augment', action='store_true', help='augmented inference')
+    opt = parser.parse_args()
+    opt.cfg = check_file(opt.cfg)  # check file
+    opt.names = check_file(opt.names)  # check file
+    print(opt)
+
+    with torch.no_grad():
+        detect()

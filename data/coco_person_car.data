@@ -1,0 +1,5 @@
+classes=2
+train=../coco2017_person_car/train2017.txt
+# valid=../coco2017_person_car/train2017.txt
+valid=../coco2017_person_car/val_easy.txt
+names=data/coco_person_car.names

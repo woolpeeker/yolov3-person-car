@@ -1,130 +1,275 @@
 import argparse
+import json
+
+from torch.utils.data import DataLoader
 
 from models import *
 from utils.datasets import *
 from utils.utils import *
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--epochs', type=int, default=200, help='number of epochs')
-parser.add_argument('--batch_size', type=int, default=32, help='size of each image batch')
-parser.add_argument('--model_config_path', type=str, default='cfg/yolov3.cfg', help='path to model config file')
-parser.add_argument('--data_config_path', type=str, default='cfg/coco.data', help='path to data config file')
-parser.add_argument('--weights_path', type=str, default='checkpoints/yolov3.weights', help='path to weights file')
-parser.add_argument('--class_path', type=str, default='data/coco.names', help='path to class label file')
-parser.add_argument('--iou_thres', type=float, default=0.5, help='iou threshold required to qualify as detected')
-parser.add_argument('--conf_thres', type=float, default=0.5, help='object confidence threshold')
-parser.add_argument('--nms_thres', type=float, default=0.45, help='iou threshold for non-maximum suppression')
-parser.add_argument('--n_cpu', type=int, default=0, help='number of cpu threads to use during batch generation')
-parser.add_argument('--img_size', type=int, default=416, help='size of each image dimension')
-parser.add_argument('--use_cuda', type=bool, default=True, help='whether to use cuda if available')
-opt = parser.parse_args()
-print(opt)
 
-cuda = torch.cuda.is_available() and opt.use_cuda
-device = torch.device('cuda:0' if cuda else 'cpu')
+def test(cfg,
+         data,
+         weights=None,
+         batch_size=16,
+         imgsz=416,
+         conf_thres=0.001,
+         iou_thres=0.6,  # for nms
+         save_json=False,
+         single_cls=False,
+         augment=False,
+         model=None,
+         dataloader=None,
+         multi_label=True):
+    # Initialize/load model and set device
+    if model is None:
+        is_training = False
+        device = torch_utils.select_device(opt.device, batch_size=batch_size)
+        verbose = opt.task == 'test'
 
-# Get data configuration
-data_config = parse_data_config(opt.data_config_path)
-test_path = data_config['valid']
-num_classes = int(data_config['classes'])
+        # Remove previous
+        for f in glob.glob('test_batch*.jpg'):
+            os.remove(f)
 
-# Initiate model
-model = Darknet(opt.model_config_path, opt.img_size)
+        # Initialize model
+        model = Darknet(cfg, imgsz)
 
-# Load weights
-weights_path = 'checkpoints/yolov3.pt'
-if weights_path.endswith('.weights'):  # darknet format
-    load_weights(model, weights_path)
-elif weights_path.endswith('.pt'):  # pytorch format
-    checkpoint = torch.load(weights_path, map_location='cpu')
-    model.load_state_dict(checkpoint['model'])
-    del checkpoint
+        # Load weights
+        attempt_download(weights)
+        if weights.endswith('.pt'):  # pytorch format
+            model.load_state_dict(torch.load(weights, map_location=device)['model'])
+        else:  # darknet format
+            load_darknet_weights(model, weights)
 
-model.to(device).eval()
+        # Fuse
+        model.fuse()
+        model.to(device)
 
-# Get dataloader
-# dataset = ListDataset(test_path)
-# dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batch_size, shuffle=False, num_workers=opt.n_cpu)
-dataloader = ListDataset(test_path, batch_size=opt.batch_size, img_size=opt.img_size)
+        if device.type != 'cpu' and torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
+    else:  # called by train.py
+        is_training = True
+        device = next(model.parameters()).device  # get model device
+        verbose = False
 
-Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
+    # Configure run
+    data = parse_data_cfg(data)
+    nc = 1 if single_cls else int(data['classes'])  # number of classes
+    path = data['valid']  # path to test images
+    names = load_classes(data['names'])  # class names
+    iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
+    iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
+    niou = iouv.numel()
 
-n_gt = 0
-correct = 0
+    # Dataloader
+    if dataloader is None:
+        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, single_cls=opt.single_cls, pad=0.5)
+        batch_size = min(batch_size, len(dataset))
+        dataloader = DataLoader(dataset,
+                                batch_size=batch_size,
+                                num_workers=min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8]),
+                                pin_memory=True,
+                                collate_fn=dataset.collate_fn)
 
-print('Compute mAP...')
+    seen = 0
+    model.eval()
+    _ = model(torch.zeros((1, 3, imgsz, imgsz), device=device)) if device.type != 'cpu' else None  # run once
+    coco91class = coco80_to_coco91_class()
+    s = ('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@0.5', 'F1')
+    p, r, f1, mp, mr, map, mf1, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
+    loss = torch.zeros(3, device=device)
+    jdict, stats, ap, ap_class = [], [], [], []
+    for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+        imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
+        targets = targets.to(device)
+        nb, _, height, width = imgs.shape  # batch size, channels, height, width
+        whwh = torch.Tensor([width, height, width, height]).to(device)
 
-outputs = []
-targets = None
-APs = []
-for batch_i, (imgs, targets) in enumerate(dataloader):
-    imgs = imgs.to(device)
+        # Disable gradients
+        with torch.no_grad():
+            # Run model
+            t = torch_utils.time_synchronized()
+            inf_out, train_out = model(imgs, augment=augment)  # inference and training outputs
+            t0 += torch_utils.time_synchronized() - t
 
-    with torch.no_grad():
-        output = model(imgs)
-        output = non_max_suppression(output, conf_thres=opt.conf_thres, nms_thres=opt.nms_thres)
+            # Compute loss
+            if is_training:  # if model has loss hyperparameters
+                loss += compute_loss(train_out, targets, model)[1][:3]  # GIoU, obj, cls
 
-    # Compute average precision for each sample
-    for sample_i in range(len(targets)):
-        correct = []
+            # Run NMS
+            t = torch_utils.time_synchronized()
+            output = non_max_suppression(inf_out, conf_thres=conf_thres, iou_thres=iou_thres, multi_label=multi_label)
+            t1 += torch_utils.time_synchronized() - t
 
-        # Get labels for sample where width is not zero (dummies)
-        annotations = targets[sample_i]
-        # Extract detections
-        detections = output[sample_i]
+        # Statistics per image
+        for si, pred in enumerate(output):
+            labels = targets[targets[:, 0] == si, 1:]
+            nl = len(labels)
+            tcls = labels[:, 0].tolist() if nl else []  # target class
+            seen += 1
 
-        if detections is None:
-            # If there are no detections but there are annotations mask as zero AP
-            if annotations.size(0) != 0:
-                APs.append(0)
-            continue
+            if pred is None:
+                if nl:
+                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                continue
 
-        # Get detections sorted by decreasing confidence scores
-        detections = detections[np.argsort(-detections[:, 4])]
+            # Append to text file
+            # with open('test.txt', 'a') as file:
+            #    [file.write('%11.5g' * 7 % tuple(x) + '\n') for x in pred]
 
-        # If no annotations add number of detections as incorrect
-        if annotations.size(0) == 0:
-            correct.extend([0 for _ in range(len(detections))])
-        else:
-            # Extract target boxes as (x1, y1, x2, y2)
-            target_boxes = torch.FloatTensor(annotations[:, 1:].shape)
-            target_boxes[:, 0] = (annotations[:, 1] - annotations[:, 3] / 2)
-            target_boxes[:, 1] = (annotations[:, 2] - annotations[:, 4] / 2)
-            target_boxes[:, 2] = (annotations[:, 1] + annotations[:, 3] / 2)
-            target_boxes[:, 3] = (annotations[:, 2] + annotations[:, 4] / 2)
-            target_boxes *= opt.img_size
+            # Clip boxes to image bounds
+            clip_coords(pred, (height, width))
 
-            detected = []
-            for *pred_bbox, conf, obj_conf, obj_pred in detections:
+            # Append to pycocotools JSON dictionary
+            if save_json:
+                # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
+                image_id = int(Path(paths[si]).stem.split('_')[-1])
+                box = pred[:, :4].clone()  # xyxy
+                scale_coords(imgs[si].shape[1:], box, shapes[si][0], shapes[si][1])  # to original shape
+                box = xyxy2xywh(box)  # xywh
+                box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+                for p, b in zip(pred.tolist(), box.tolist()):
+                    jdict.append({'image_id': image_id,
+                                  'category_id': coco91class[int(p[5])],
+                                  'bbox': [round(x, 3) for x in b],
+                                  'score': round(p[4], 5)})
 
-                pred_bbox = torch.FloatTensor(pred_bbox).view(1, -1)
-                # Compute iou with target boxes
-                iou = bbox_iou(pred_bbox, target_boxes)
-                # Extract index of largest overlap
-                best_i = np.argmax(iou)
-                # If overlap exceeds threshold and classification is correct mark as correct
-                if iou[best_i] > opt.iou_thres and obj_pred == annotations[best_i, 0] and best_i not in detected:
-                    correct.append(1)
-                    detected.append(best_i)
-                else:
-                    correct.append(0)
+            # Assign all predictions as incorrect
+            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
+            if nl:
+                detected = []  # target indices
+                tcls_tensor = labels[:, 0]
 
-        # Extract true and false positives
-        true_positives = np.array(correct)
-        false_positives = 1 - true_positives
+                # target boxes
+                tbox = xywh2xyxy(labels[:, 1:5]) * whwh
 
-        # Compute cumulative false positives and true positives
-        false_positives = np.cumsum(false_positives)
-        true_positives = np.cumsum(true_positives)
+                # Per target class
+                for cls in torch.unique(tcls_tensor):
+                    ti = (cls == tcls_tensor).nonzero().view(-1)  # target indices
+                    pi = (cls == pred[:, 5]).nonzero().view(-1)  # prediction indices
 
-        # Compute recall and precision at all ranks
-        recall = true_positives / annotations.size(0) if annotations.size(0) else true_positives
-        precision = true_positives / np.maximum(true_positives + false_positives, np.finfo(np.float64).eps)
+                    # Search for detections
+                    if pi.shape[0]:
+                        # Prediction to target ious
+                        ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
 
-        # Compute average precision
-        AP = compute_ap(recall, precision)
-        APs.append(AP)
+                        # Append detections
+                        for j in (ious > iouv[0]).nonzero():
+                            d = ti[i[j]]  # detected target
+                            if d not in detected:
+                                detected.append(d)
+                                correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
+                                if len(detected) == nl:  # all targets already located in image
+                                    break
+            if correct.sum() / correct.shape[0] > 0.8:
+                if len(detected) / len(tbox) > 0.8:
+                    print(paths[si])
 
-        print("+ Sample [%d/%d] AP: %.4f (%.4f)" % (len(APs), len(dataloader) * opt.batch_size, AP, np.mean(APs)))
+            # Append statistics (correct, conf, pcls, tcls)
+            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
 
-print("Mean Average Precision: %.4f" % np.mean(APs))
+        # Plot images
+        if batch_i < 1:
+            f = 'test_batch%g_gt.jpg' % batch_i  # filename
+            plot_images(imgs, targets, paths=paths, names=names, fname=f)  # ground truth
+            f = 'test_batch%g_pred.jpg' % batch_i
+            plot_images(imgs, output_to_target(output, width, height), paths=paths, names=names, fname=f)  # predictions
+
+    # Compute statistics
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
+    if len(stats):
+        p, r, ap, f1, ap_class = ap_per_class(*stats)
+        if niou > 1:
+            p, r, ap, f1 = p[:, 0], r[:, 0], ap.mean(1), ap[:, 0]  # [P, R, AP@0.5:0.95, AP@0.5]
+        mp, mr, map, mf1 = p.mean(), r.mean(), ap.mean(), f1.mean()
+        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
+    else:
+        nt = torch.zeros(1)
+
+    # Print results
+    pf = '%20s' + '%10.3g' * 6  # print format
+    print(pf % ('all', seen, nt.sum(), mp, mr, map, mf1))
+
+    # Print results per class
+    if verbose and nc > 1 and len(stats):
+        for i, c in enumerate(ap_class):
+            print(pf % (names[c], seen, nt[c], p[i], r[i], ap[i], f1[i]))
+
+    # Print speeds
+    if verbose or save_json:
+        t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
+        print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
+
+    # Save JSON
+    if save_json and map and len(jdict):
+        print('\nCOCO mAP with pycocotools...')
+        imgIds = [int(Path(x).stem.split('_')[-1]) for x in dataloader.dataset.img_files]
+        with open('results.json', 'w') as file:
+            json.dump(jdict, file)
+
+        try:
+            from pycocotools.coco import COCO
+            from pycocotools.cocoeval import COCOeval
+
+            # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
+            cocoGt = COCO(glob.glob('../coco/annotations/instances_val*.json')[0])  # initialize COCO ground truth api
+            cocoDt = cocoGt.loadRes('results.json')  # initialize COCO pred api
+
+            cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
+            cocoEval.params.imgIds = imgIds  # [:32]  # only evaluate these images
+            cocoEval.evaluate()
+            cocoEval.accumulate()
+            cocoEval.summarize()
+            # mf1, map = cocoEval.stats[:2]  # update to pycocotools results (mAP@0.5:0.95, mAP@0.5)
+        except:
+            print('WARNING: pycocotools must be installed with numpy==1.17 to run correctly. '
+                  'See https://github.com/cocodataset/cocoapi/issues/356')
+
+    # Return results
+    maps = np.zeros(nc) + map
+    for i, c in enumerate(ap_class):
+        maps[c] = ap[i]
+    return (mp, mr, map, mf1, *(loss.cpu() / len(dataloader)).tolist()), maps
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(prog='test.py')
+    parser.add_argument('--cfg', type=str, default='cfg/yolov3-spp.cfg', help='*.cfg path')
+    parser.add_argument('--data', type=str, default='data/coco2014.data', help='*.data path')
+    parser.add_argument('--weights', type=str, default='weights/yolov3-spp-ultralytics.pt', help='weights path')
+    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
+    parser.add_argument('--img-size', type=int, default=512, help='inference size (pixels)')
+    parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.6, help='IOU threshold for NMS')
+    parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
+    parser.add_argument('--task', default='test', help="'test', 'study', 'benchmark'")
+    parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
+    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
+    parser.add_argument('--augment', action='store_true', help='augmented inference')
+    opt = parser.parse_args()
+    opt.save_json = opt.save_json or any([x in opt.data for x in ['coco.data', 'coco2014.data', 'coco2017.data']])
+    opt.cfg = check_file(opt.cfg)  # check file
+    opt.data = check_file(opt.data)  # check file
+    print(opt)
+
+    # task = 'test', 'study', 'benchmark'
+    if opt.task == 'test':  # (default) test normally
+        test(opt.cfg,
+             opt.data,
+             opt.weights,
+             opt.batch_size,
+             opt.img_size,
+             opt.conf_thres,
+             opt.iou_thres,
+             opt.save_json,
+             opt.single_cls,
+             opt.augment)
+
+    elif opt.task == 'benchmark':  # mAPs at 256-640 at conf 0.5 and 0.7
+        y = []
+        for i in list(range(256, 640, 128)):  # img-size
+            for j in [0.6, 0.7]:  # iou-thres
+                t = time.time()
+                r = test(opt.cfg, opt.data, opt.weights, opt.batch_size, i, opt.conf_thres, j, opt.save_json)[0]
+                y.append(r + (time.time() - t,))
+        np.savetxt('benchmark.txt', y, fmt='%10.4g')  # y = np.loadtxt('study.txt')
