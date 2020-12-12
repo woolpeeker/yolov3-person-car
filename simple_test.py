@@ -8,6 +8,8 @@ from utils.datasets import *
 from utils.utils import *
 import cv2
 
+OUT_IMG_DIR = Path('./out_imgs')
+
 def preprocess(img_file, img_size):
     img = cv2.imread(str(img_file))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -40,7 +42,9 @@ def test(args):
     nc = int(data['classes'])  # number of classes
     path = Path(data['valid'])  # path to test images
     names = load_classes(data['names'])  # class names
+    colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(names))]
 
+    OUT_IMG_DIR.mkdir(parents=True, exist_ok=True)
     assert path.suffix=='.txt'
     fp = open('../mAP/input/detection-results.txt', 'w')
     for img_file in np.loadtxt(str(path), dtype=str).tolist():
@@ -53,9 +57,14 @@ def test(args):
         file_id = Path(img_file).with_suffix('').name
         if det is not None:
             det[:, :4] = (det[:, :4] / scale).round()
+            image = cv2.imread(str(img_file))
             for *xyxy, conf, cls_id in reversed(det):
+                label = '%s %.2f' % (names[int(cls_id)], conf)
+                plot_one_box(xyxy, image, label=label, color=colors[int(cls_id)])
                 fp.write('%s %s %f %d %d %d %d\n' % (file_id, names[int(cls_id)], conf, *xyxy))
         fp.write('%s %s %f %d %d %d %d\n' % (file_id, names[0], 0, 0, 0, 1, 1))
+        out_file = OUT_IMG_DIR / Path(img_file).name
+        cv2.imwrite(str(out_file), image)
     
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
