@@ -54,10 +54,10 @@ def test(args):
             inf_out, train_out = model(inp_tensor, augment=False) 
             output = non_max_suppression(inf_out, conf_thres=args.conf_thres, iou_thres=0.4, multi_label=False)
         det = output[0] # batch_size = 1
+        image = cv2.imread(str(img_file))
         file_id = Path(img_file).with_suffix('').name
         if det is not None:
             det[:, :4] = (det[:, :4] / scale).round()
-            image = cv2.imread(str(img_file))
             for *xyxy, conf, cls_id in reversed(det):
                 label = '%s %.2f' % (names[int(cls_id)], conf)
                 plot_one_box(xyxy, image, label=label, color=colors[int(cls_id)])

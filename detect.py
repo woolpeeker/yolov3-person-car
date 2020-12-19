@@ -7,24 +7,24 @@ from utils.utils import *
 
 def detect(save_img=False):
     imgsz = (320, 192) if ONNX_EXPORT else opt.img_size  # (320, 192) or (416, 256) or (608, 352) for (height, width)
-    out, source, weights, half, view_img, save_txt = opt.output, opt.source, opt.weights, opt.half, opt.view_img, opt.save_txt
+    source, weights, half, view_img, save_txt = opt.source, opt.weights, opt.half, opt.view_img, opt.save_txt
     save_img = opt.save_img
     # webcam = source == '0' or source.startswith('rtsp') or source.startswith('http') or source.endswith('.txt')
     webcam = False
-    save_txt = Path(save_txt)
-    if str(save_txt).endswith('.txt'):
-        txt_file = save_txt
+    if save_txt is not None and str(save_txt).endswith('.txt'):
+        txt_file = Path(save_txt)
         save_txt = True
         txt_file.parent.mkdir(parents=True, exist_ok=True)
         txt_file = open(txt_file, 'w')
     else:
         save_txt = False
+    
+    if save_img is not None:
+        save_img = Path(save_img)
+        save_img.mkdir(parents=True, exist_ok=True)
 
     # Initialize
     device = torch_utils.select_device(device='cpu' if ONNX_EXPORT else opt.device)
-    if os.path.exists(out):
-        shutil.rmtree(out)  # delete output folder
-    os.makedirs(out)  # make new output folder
 
     # Initialize model
     model = Darknet(opt.cfg, imgsz)
@@ -45,29 +45,6 @@ def detect(save_img=False):
 
     # Eval mode
     model.to(device).eval()
-
-    # Fuse Conv2d + BatchNorm2d layers
-    # model.fuse()
-
-    # Export mode
-    if ONNX_EXPORT:
-        model.fuse()
-        img = torch.zeros((1, 3) + imgsz)  # (1, 3, 320, 192)
-        f = opt.weights.replace(opt.weights.split('.')[-1], 'onnx')  # *.onnx filename
-        torch.onnx.export(model, img, f, verbose=False, opset_version=11,
-                          input_names=['images'], output_names=['classes', 'boxes'])
-
-        # Validate exported model
-        import onnx
-        model = onnx.load(f)  # Load the ONNX model
-        onnx.checker.check_model(model)  # Check that the IR is well formed
-        print(onnx.helper.printable_graph(model.graph))  # Print a human readable representation of the graph
-        return
-
-    # Half precision
-    half = half and device.type != 'cpu'  # half precision only supported on CUDA
-    if half:
-        model.half()
 
     # Set Dataloader
     vid_path, vid_writer = None, None
@@ -117,8 +94,6 @@ def detect(save_img=False):
                 p, s, im0 = path[i], '%g: ' % i, im0s[i].copy()
             else:
                 p, s, im0 = path, '', im0s
-
-            save_path = str(Path(out) / Path(p).name)
             s += '%gx%g ' % img.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  #  normalization gain whwh
             if det is not None and len(det):
@@ -148,16 +123,11 @@ def detect(save_img=False):
             # Print time (inference + NMS)
             print('%sDone. (%.3fs)' % (s, t2 - t1))
 
-            # Stream results
-            if view_img:
-                cv2.imshow(p, im0)
-                if cv2.waitKey(1) == ord('q'):  # q to quit
-                    raise StopIteration
-
             # Save results (image with detections)
-            if save_img:
+            if save_img is not None:
                 if dataset.mode == 'images':
-                    cv2.imwrite(save_path, im0)
+                    save_path = Path(save_img) / Path(p).name
+                    cv2.imwrite(str(save_path), im0)
                 else:
                     if vid_path != save_path:  # new video
                         vid_path = save_path
@@ -170,11 +140,6 @@ def detect(save_img=False):
                         vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*opt.fourcc), fps, (w, h))
                     vid_writer.write(im0)
 
-    if save_txt or save_img:
-        print('Results saved to %s' % os.getcwd() + os.sep + out)
-        if platform == 'darwin':  # MacOS
-            os.system('open ' + save_path)
-
     print('Done. (%.3fs)' % (time.time() - t0))
 
 
@@ -184,16 +149,15 @@ if __name__ == '__main__':
     parser.add_argument('--names', type=str, default='data/coco.names', help='*.names path')
     parser.add_argument('--weights', type=str, default='weights/yolov3-spp-ultralytics.pt', help='weights path')
     parser.add_argument('--source', type=str, default='data/samples', help='source')  # input file/folder, 0 for webcam
-    parser.add_argument('--output', type=str, default='output', help='output folder')  # output folder
     parser.add_argument('--img-size', type=int, default=512, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.3, help='object confidence threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.01, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='IOU threshold for NMS')
     parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
     parser.add_argument('--half', action='store_true', help='half precision FP16 inference')
     parser.add_argument('--device', default='', help='device id (i.e. 0 or 0,1) or cpu')
     parser.add_argument('--view-img', action='store_true', help='display results')
     parser.add_argument('--save-txt', type=str, help='save results to *.txt')
-    parser.add_argument('--save-img', action='store_true', help='save images')
+    parser.add_argument('--save-img', type=str, help='save images')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')

@@ -123,11 +123,9 @@ def test(cfg,
             # Append to pycocotools JSON dictionary
             if save_json:
                 # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
-                image_id = int(Path(paths[si]).stem.split('_')[-1])
+                image_id = Path(paths[si]).stem
                 box = pred[:, :4].clone()  # xyxy
                 scale_coords(imgs[si].shape[1:], box, shapes[si][0], shapes[si][1])  # to original shape
-                box = xyxy2xywh(box)  # xywh
-                box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
                 for p, b in zip(pred.tolist(), box.tolist()):
                     jdict.append({'image_id': image_id,
                                   'category_id': coco91class[int(p[5])],
@@ -161,9 +159,6 @@ def test(cfg,
                                 correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
                                 if len(detected) == nl:  # all targets already located in image
                                     break
-            if correct.sum() / correct.shape[0] > 0.8:
-                if len(detected) / len(tbox) > 0.8:
-                    print(paths[si])
 
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
